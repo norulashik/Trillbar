@@ -1,0 +1,36 @@
+# Audio processing
+ffmpeg-python>=0.2.0
+librosa>=0.10.0
+soundfile>=0.12.0
+pydub>=0.25.0
+pyloudnorm>=0.1.1
+praat-parselmouth>=0.4.3
+numpy>=1.24.0
+
+# Source separation (heavy but CPU-compatible)
+demucs>=4.0.0
+
+# ASR (CPU-friendly)
+faster-whisper>=1.0.0
+
+# Speaker diarization (requires HuggingFace token)
+pyannote.audio>=3.1.0
+
+# Translation / LLM
+google-genai>=1.0.0
+
+# Voice cloning + TTS API
+requests>=2.31.0
+
+# Web framework (backend)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Frontend
+streamlit>=1.30.0
+pandas>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.66.0
