@@ -82,3 +82,6 @@ STRETCH_TOLERANCE = 0.30     # ±30 %
 
 # ── Translation ───────────────────────────────────────────────────────────────
 GEMINI_TRANSLATE_MODEL = "gemini-2.5-flash"   # fast + cheap
+
+# ── Emotion-Aware Dubbing ────────────────────────────────────────────────────
+ENABLE_EMOTION: bool = os.getenv("ENABLE_EMOTION", "true").lower() == "true"

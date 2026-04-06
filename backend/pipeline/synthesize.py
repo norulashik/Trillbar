@@ -29,6 +29,37 @@ from backend.utils.timing import Segment
 
 logger = logging.getLogger(__name__)
 
+# ── Emotion → ElevenLabs voice_settings mapping ──────────────────────────────
+# Each emotion maps to (style, stability, similarity_boost).
+# emotion_intensity (0–1) interpolates between neutral and the target row.
+EMOTION_VOICE_SETTINGS: dict[str, tuple[float, float, float]] = {
+    "neutral":  (0.00, 0.50, 1.00),
+    "happy":    (0.35, 0.35, 0.95),
+    "excited":  (0.45, 0.30, 0.90),
+    "angry":    (0.50, 0.30, 0.90),
+    "sad":      (0.25, 0.45, 1.00),
+    "fear":     (0.40, 0.30, 0.95),
+    "surprise": (0.45, 0.30, 0.90),
+    "calm":     (0.15, 0.55, 1.00),
+    "disgust":  (0.35, 0.40, 0.95),
+}
+
+def _emotion_voice_settings(emotion: str | None, intensity: float = 1.0) -> dict:
+    """Return ElevenLabs voice_settings dict modulated by emotion."""
+    neutral = EMOTION_VOICE_SETTINGS["neutral"]
+    target = EMOTION_VOICE_SETTINGS.get(emotion or "neutral", neutral)
+    t = max(0.0, min(1.0, intensity))
+    style = neutral[0] + t * (target[0] - neutral[0])
+    stability = neutral[1] + t * (target[1] - neutral[1])
+    sim_boost = neutral[2] + t * (target[2] - neutral[2])
+    return {
+        "stability": round(stability, 2),
+        "similarity_boost": round(sim_boost, 2),
+        "style": round(style, 2),
+        "use_speaker_boost": True,
+    }
+
+
 # ── Voice profile store: speaker_id → {voice_id, reference_path} ─────────────
 _voice_profiles: dict[str, dict] = {}
 
@@ -120,6 +151,8 @@ def synthesize_segments(
                 lang_cfg=lang_cfg,
                 target_language=target_language,
                 out_path=out_path,
+                emotion=seg.get("emotion"),
+                emotion_intensity=seg.get("emotion_intensity", 1.0),
             )
             time.sleep(0.25)  # polite rate limit
 
@@ -273,6 +306,8 @@ def _synthesize_one(
     lang_cfg: dict,
     target_language: str,
     out_path: Path,
+    emotion: str | None = None,
+    emotion_intensity: float = 1.0,
 ) -> None:
     """Call TTS API and save result to out_path (WAV)."""
     if config.TTS_BACKEND == "sarvam" and config.SARVAM_API_KEY:
@@ -280,7 +315,8 @@ def _synthesize_one(
         return
 
     # ElevenLabs (default)
-    _synth_elevenlabs(text, voice_id, lang_cfg["elevenlabs_code"], target_language, out_path)
+    _synth_elevenlabs(text, voice_id, lang_cfg["elevenlabs_code"], target_language, out_path,
+                      emotion=emotion, emotion_intensity=emotion_intensity)
 
 
 def _synth_elevenlabs(
@@ -289,6 +325,8 @@ def _synth_elevenlabs(
     lang_code: str,
     target_language: str,
     out_path: Path,
+    emotion: str | None = None,
+    emotion_intensity: float = 1.0,
 ) -> None:
     if not config.ELEVENLABS_API_KEY:
         raise RuntimeError(
@@ -305,16 +343,12 @@ def _synth_elevenlabs(
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }
+    voice_settings = _emotion_voice_settings(emotion, emotion_intensity)
     payload = {
         "text": text,
         "model_id": config.ELEVENLABS_MODEL,
         "language_code": lang_code,
-        "voice_settings": {
-            "stability": 0.40,
-            "similarity_boost": 1.0,
-            "style": 0.0,
-            "use_speaker_boost": True,
-        },
+        "voice_settings": voice_settings,
     }
 
     resp = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
@@ -408,6 +442,8 @@ def speech_to_speech(
     input_audio_path: str | Path,
     output_path: str | Path,
     max_chunk_sec: float = 45.0,
+    emotion: str | None = None,
+    emotion_intensity: float = 1.0,
 ) -> Path:
     """Convert input audio to the cloned voice using ElevenLabs Speech-to-Speech.
 
@@ -436,7 +472,8 @@ def speech_to_speech(
 
     if duration <= max_chunk_sec:
         # Short audio — single API call
-        _sts_single(voice_id, input_audio_path, output_path)
+        _sts_single(voice_id, input_audio_path, output_path,
+                     emotion=emotion, emotion_intensity=emotion_intensity)
     else:
         # Long audio — split into chunks, convert each, reassemble
         audio, sr = load_audio(str(input_audio_path))
@@ -457,7 +494,8 @@ def speech_to_speech(
 
             out_chunk = chunks_dir / f"converted_{chunk_idx:03d}.wav"
             logger.info("STS chunk %d/%d (%.1f s)", chunk_idx + 1, num_chunks, len(chunk) / sr)
-            _sts_single(voice_id, chunk_path, out_chunk)
+            _sts_single(voice_id, chunk_path, out_chunk,
+                         emotion=emotion, emotion_intensity=emotion_intensity)
             time.sleep(0.5)  # rate limit
 
             conv_audio, conv_sr = load_audio(str(out_chunk))
@@ -487,17 +525,27 @@ def speech_to_speech(
     return output_path
 
 
-def _sts_single(voice_id: str, input_path: Path, output_path: Path) -> None:
+def _sts_single(
+    voice_id: str,
+    input_path: Path,
+    output_path: Path,
+    emotion: str | None = None,
+    emotion_intensity: float = 1.0,
+) -> None:
     """Single Speech-to-Speech API call."""
     url = f"{config.ELEVENLABS_BASE_URL}/speech-to-speech/{voice_id}"
     headers = {
         "xi-api-key": config.ELEVENLABS_API_KEY,
         "Accept": "audio/mpeg",
     }
+    # Use emotion-aware settings, with STS-specific base (higher stability)
+    vs = _emotion_voice_settings(emotion, emotion_intensity)
+    vs["stability"] = max(vs["stability"], 0.45)  # STS needs slightly higher stability
+    import json as _json
     data = {
         "model_id": "eleven_multilingual_sts_v2",
         "output_format": "mp3_44100_192",
-        "voice_settings": '{"stability": 0.55, "similarity_boost": 1.0, "style": 0.15, "use_speaker_boost": true}',
+        "voice_settings": _json.dumps(vs),
     }
 
     with open(input_path, "rb") as f:
@@ -555,3 +603,62 @@ def extract_segment_audio(
         result.append(new_seg)
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Character detection (for multi-character mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_characters(
+    segments: list[Segment],
+    vocals_44k_path: str | Path,
+    job_id: str = "default",
+) -> list[dict]:
+    """Group segments by speaker and extract a preview audio clip per character.
+
+    Returns:
+        [{"speaker_id": str, "segment_count": int, "total_duration": float,
+          "preview_path": str, "segment_ids": list[int]}]
+    """
+    vocals_path = Path(vocals_44k_path)
+    audio, sr = load_audio(vocals_path)
+    audio_mono = stereo_to_mono(audio)
+
+    preview_dir = config.TEMP_DIR / job_id / "char_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # Group by speaker
+    speakers: dict[str, list[Segment]] = {}
+    for seg in segments:
+        sid = seg.get("speaker_id", "SPEAKER_00")
+        speakers.setdefault(sid, []).append(seg)
+
+    characters = []
+    total_samples = len(audio_mono)
+    for sid, segs in sorted(speakers.items()):
+        total_dur = sum(s["end"] - s["start"] for s in segs)
+
+        # Extract ~5s preview from the longest contiguous segment
+        best_seg = max(segs, key=lambda s: s["end"] - s["start"])
+        start = max(0, int(best_seg["start"] * sr))
+        end = min(total_samples, int(best_seg["end"] * sr))
+        preview_clip = audio_mono[start:end]
+        # Cap at 5 seconds
+        max_samples = int(5.0 * sr)
+        if len(preview_clip) > max_samples:
+            preview_clip = preview_clip[:max_samples]
+
+        preview_path = preview_dir / f"preview_{sid}.wav"
+        save_audio(preview_clip, preview_path, sr)
+
+        characters.append({
+            "speaker_id": sid,
+            "segment_count": len(segs),
+            "total_duration": round(total_dur, 1),
+            "preview_path": str(preview_path),
+            "segment_ids": [s["id"] for s in segs],
+        })
+
+    logger.info("Detected %d characters: %s", len(characters),
+                ", ".join(f"{c['speaker_id']}({c['segment_count']} segs)" for c in characters))
+    return characters

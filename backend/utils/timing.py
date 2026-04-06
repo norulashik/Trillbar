@@ -17,6 +17,12 @@ class Segment(TypedDict, total=False):
     source_audio_path: str   # slice of dialogue stem for this segment
     synth_audio_path: str    # synthesised TTS output
     adjusted_audio_path: str # after prosody + acoustic adjustment
+    # Emotion fields (populated by emotion analysis stage)
+    emotion: str             # "happy", "angry", "sad", "neutral", "fear", "surprise"
+    emotion_intensity: float # 0.0 (mild) to 1.0 (extreme)
+    delivery_direction: str  # natural-language TTS direction, e.g. "Speak with quiet anger"
+    # Character mapping
+    character_name: str      # user-assigned name for this speaker
 
 
 def segment_duration(seg: Segment) -> float:

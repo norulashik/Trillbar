@@ -72,6 +72,9 @@ def translate_segments(
             src_lang=src_lang,
             tgt_lang=lang_display,
             duration_budget=seg["duration"],
+            emotion=seg.get("emotion"),
+            emotion_intensity=seg.get("emotion_intensity"),
+            delivery_direction=seg.get("delivery_direction"),
         )
         new_seg = dict(seg)
         new_seg["translated_text"] = translated_text
@@ -94,8 +97,25 @@ def _translate_one(
     src_lang: str,
     tgt_lang: str,
     duration_budget: float,
+    emotion: str | None = None,
+    emotion_intensity: float | None = None,
+    delivery_direction: str | None = None,
 ) -> str:
-    """Translate a single text string with isochrony awareness."""
+    """Translate a single text string with isochrony and emotion awareness."""
+    emotion_hint = ""
+    if emotion and emotion != "neutral":
+        parts = [f"- Emotional tone: {emotion}"]
+        if emotion_intensity is not None:
+            parts[0] += f" (intensity {emotion_intensity:.1f}/1.0)"
+        if delivery_direction:
+            parts.append(f"- Delivery: {delivery_direction}")
+        parts.append(
+            "- Match this emotional register in the translation: "
+            "angry → sharper/clipped phrasing, sad → softer/longer expressions, "
+            "happy → upbeat/energetic phrasing."
+        )
+        emotion_hint = "\n".join(parts) + "\n"
+
     prompt = (
         f"You are a professional dubbing script translator specialising in "
         f"translating {src_lang} content into {tgt_lang} for Indian OTT platforms.\n\n"
@@ -105,7 +125,8 @@ def _translate_one(
         f"- Culturally adapt for an Indian audience.\n"
         f"- The translation MUST be speakable in under {duration_budget:.1f} seconds "
         f"(time budget). Prefer concise phrasing.\n"
-        f"- Preserve the emotional tone of the original.\n\n"
+        f"- Preserve the emotional tone of the original.\n"
+        f"{emotion_hint}\n"
         f"Time budget: {duration_budget:.1f} seconds\n"
         f"Source ({src_lang}):\n{text}\n\n"
         f"Translation ({tgt_lang}):"

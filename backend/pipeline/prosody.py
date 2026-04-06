@@ -25,6 +25,19 @@ from backend.utils.timing import Segment
 
 logger = logging.getLogger(__name__)
 
+# Emotion-based pitch adjustments (semitones added on top of source-matching shift)
+EMOTION_PITCH_OFFSET: dict[str, float] = {
+    "happy":    +1.5,
+    "excited":  +2.5,
+    "angry":    +2.0,
+    "sad":      -1.5,
+    "fear":     +1.0,
+    "surprise": +2.0,
+    "calm":     -0.5,
+    "neutral":   0.0,
+    "disgust":  -0.5,
+}
+
 try:
     import parselmouth
     from parselmouth.praat import call as praat_call
@@ -70,6 +83,8 @@ def apply_prosody_transfer(
                 synth_path=synth_path,
                 out_path=out_path,
                 target_duration=seg["duration"],
+                emotion=seg.get("emotion"),
+                emotion_intensity=seg.get("emotion_intensity", 1.0),
             )
 
         new_seg = dict(seg)
@@ -89,6 +104,8 @@ def _transfer_one(
     synth_path: str,
     out_path: Path,
     target_duration: float,
+    emotion: str | None = None,
+    emotion_intensity: float = 1.0,
 ) -> None:
     # Load synthesised audio (always mono 44.1kHz from our TTS pipeline)
     synth_audio, sr = load_audio(synth_path, sr=44100, mono=True)
@@ -125,11 +142,14 @@ def _transfer_one(
         try:
             src_audio, _ = load_audio(src_path, sr=44100, mono=True)
             n_semitones = _compute_pitch_shift(src_audio, synth_audio, sr)
+            # Apply emotion-based pitch offset
+            emo_offset = EMOTION_PITCH_OFFSET.get(emotion or "neutral", 0.0) * emotion_intensity
+            n_semitones += emo_offset
             if abs(n_semitones) > 0.5:  # only shift if meaningful
                 synth_audio = librosa.effects.pitch_shift(
                     synth_audio, sr=sr, n_steps=n_semitones
                 )
-                logger.debug("Pitch shifted by %.2f semitones", n_semitones)
+                logger.debug("Pitch shifted by %.2f semitones (%.2f from emotion)", n_semitones, emo_offset)
         except Exception as e:
             logger.debug("Pitch shift failed (non-critical): %s", e)
 
