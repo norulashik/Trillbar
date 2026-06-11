@@ -17,10 +17,24 @@ class Segment(TypedDict, total=False):
     source_audio_path: str   # slice of dialogue stem for this segment
     synth_audio_path: str    # synthesised TTS output
     adjusted_audio_path: str # after prosody + acoustic adjustment
+    matched_audio_path: str  # after acoustic matching
+    processed_audio_path: str  # after pedalboard post-processing
     # Emotion fields (populated by emotion analysis stage)
     emotion: str             # "happy", "angry", "sad", "neutral", "fear", "surprise"
     emotion_intensity: float # 0.0 (mild) to 1.0 (extreme)
     delivery_direction: str  # natural-language TTS direction, e.g. "Speak with quiet anger"
+    # Extended vocal analysis (populated by audio-based emotion stage)
+    vocal_character: str     # e.g. "raspy, mid-range, fast delivery"
+    speaking_rate_wpm: float # words per minute estimated from source audio
+    source_f0_mean: float    # mean F0 in Hz extracted from source segment
+    # Voice synthesis
+    voice_id: str            # ElevenLabs voice_id used for this segment
+    # Pedalboard post-processing params (AI-suggested, overridable per segment)
+    pedalboard_params: dict
+    # Quality assessment
+    mos_score: float         # automated MOS estimate 1.0–5.0
+    quality_notes: str       # human-readable quality critique
+    needs_regen: bool        # True if quality below threshold
     # Character mapping
     character_name: str      # user-assigned name for this speaker
 

@@ -35,7 +35,13 @@ def _ffmpeg_bin() -> str:
         )
 
 
-def extract_audio(input_path: str | Path, job_id: str = "default") -> dict:
+def extract_audio(
+    input_path: str | Path,
+    job_id: str = "default",
+    trim_in: float = 0.0,
+    trim_out: float = 0.0,
+    keep_ranges: list[dict] | None = None,
+) -> dict:
     """Extract audio from a video/audio file.
 
     Returns a dict with paths:
@@ -57,29 +63,35 @@ def extract_audio(input_path: str | Path, job_id: str = "default") -> dict:
 
     logger.info("Extracting audio from: %s", input_path)
 
-    # 44.1 kHz stereo — used later for stem mixing
-    _run_ffmpeg(
-        str(input_path),
-        str(full_44k),
-        sample_rate=44100,
-        channels=2,
-    )
-
-    # 16 kHz mono — used by Whisper + pyannote
-    _run_ffmpeg(
-        str(input_path),
-        str(full_16k),
-        sample_rate=16000,
-        channels=1,
-    )
+    if keep_ranges and len(keep_ranges) > 0:
+        # Multi-cut: stitch only the kept segments together
+        logger.info("Multi-cut mode: %d keep range(s)", len(keep_ranges))
+        _run_ffmpeg_concat(str(input_path), str(full_44k), keep_ranges, sample_rate=44100, channels=2)
+        _run_ffmpeg_concat(str(input_path), str(full_16k), keep_ranges, sample_rate=16000, channels=1)
+    else:
+        # Simple trim (or full extract)
+        _run_ffmpeg(str(input_path), str(full_44k), sample_rate=44100, channels=2, trim_in=trim_in, trim_out=trim_out)
+        _run_ffmpeg(str(input_path), str(full_16k), sample_rate=16000, channels=1, trim_in=trim_in, trim_out=trim_out)
 
     duration = _get_duration(str(full_44k))
     logger.info("Audio extracted. Duration: %.2f s", duration)
+
+    # Preserve original video file for lip sync review
+    src_ext = Path(input_path).suffix.lower()
+    is_video = src_ext in {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    source_video_path = None
+    if is_video:
+        dest = out_dir / f"source_video{src_ext}"
+        shutil.copy2(str(input_path), str(dest))
+        source_video_path = str(dest)
+        logger.info("Source video preserved: %s", dest)
 
     return {
         "full_44k": full_44k,
         "full_16k": full_16k,
         "duration": duration,
+        "is_video": is_video,
+        "source_video_path": source_video_path,
     }
 
 
@@ -88,10 +100,16 @@ def _run_ffmpeg(
     output_path: str,
     sample_rate: int,
     channels: int,
+    trim_in: float = 0.0,
+    trim_out: float = 0.0,
 ) -> None:
-    cmd = [
-        _ffmpeg_bin(),
-        "-y",                     # overwrite output
+    cmd = [_ffmpeg_bin(), "-y"]
+    # Fast-seek trim: -ss/-to before -i seeks in the container without decoding
+    if trim_in > 0:
+        cmd += ["-ss", str(trim_in)]
+    if trim_out > 0:
+        cmd += ["-to", str(trim_out)]
+    cmd += [
         "-i", input_path,
         "-vn",                    # no video
         "-acodec", "pcm_s16le",  # 16-bit PCM
@@ -104,6 +122,40 @@ def _run_ffmpeg(
         raise RuntimeError(
             f"ffmpeg failed:\n{result.stderr}"
         )
+
+
+def _run_ffmpeg_concat(
+    input_path: str,
+    output_path: str,
+    keep_ranges: list[dict],
+    sample_rate: int,
+    channels: int,
+) -> None:
+    """Extract and concatenate multiple time ranges from a single input file."""
+    filter_parts = []
+    concat_inputs = ""
+    for i, r in enumerate(keep_ranges):
+        filter_parts.append(
+            f"[0:a]atrim=start={r['start']}:end={r['end']},asetpts=N/SR/TB[seg{i}]"
+        )
+        concat_inputs += f"[seg{i}]"
+    n = len(keep_ranges)
+    filter_parts.append(f"{concat_inputs}concat=n={n}:v=0:a=1[aout]")
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        _ffmpeg_bin(), "-y",
+        "-i", input_path,
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate),
+        "-ac", str(channels),
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed:\n{result.stderr}")
 
 
 def _get_duration(wav_path: str) -> float:

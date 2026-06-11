@@ -1,0 +1,82 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+}
+
+/* Thin scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #1a1a1a; }
+::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #4a4a4a; }
+
+/* Panel border */
+.panel {
+  @apply bg-tb-panel border border-tb-border;
+}
+
+.panel-header {
+  @apply bg-tb-header border-b border-tb-border px-3 py-1.5 text-xs font-semibold text-tb-muted uppercase tracking-widest;
+}
+
+/* Accent button */
+.btn-accent {
+  @apply bg-tb-accent hover:bg-tb-accent-dim text-white text-xs font-medium px-3 py-1.5 rounded transition-colors;
+}
+
+.btn-ghost {
+  @apply bg-transparent hover:bg-white/5 text-tb-muted hover:text-tb-text text-xs px-2 py-1 rounded transition-colors;
+}
+
+/* Segment row */
+.segment-row {
+  @apply border-b border-tb-border px-3 py-2 cursor-pointer hover:bg-white/[0.03] transition-colors;
+}
+
+.segment-row.selected {
+  @apply bg-tb-accent/10 border-l-2 border-l-tb-accent;
+}
+
+/* Input / textarea */
+.tb-input {
+  @apply bg-tb-bg border border-tb-border text-tb-text text-xs px-2 py-1 rounded outline-none
+         focus:border-tb-accent/50 transition-colors w-full;
+}
+
+/* Range slider */
+input[type='range'] {
+  -webkit-appearance: none;
+  height: 3px;
+  border-radius: 2px;
+  background: #3a3a3a;
+  outline: none;
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #a259ff;
+  cursor: pointer;
+}
+
+/* Dark-theme select options */
+select.tb-input option,
+select option {
+  background: #232323;
+  color: #e0e0e0;
+}

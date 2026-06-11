@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from backend import config
+
 # Configure logging before importing pipeline modules
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +57,7 @@ def run_pipeline(
             "elapsed": float,
         }
     """
-    from backend.pipeline import ingest, separation, transcribe, translate, synthesize, prosody, acoustic, assemble
+    from backend.pipeline import ingest, separation, transcribe, translate, synthesize, prosody, acoustic, assemble, postprocess, quality
     from backend.utils.timing import merge_short_segments
 
     def _progress(stage: str, pct: float):
@@ -69,6 +71,8 @@ def run_pipeline(
     _progress("Extracting audio from video", 5)
     audio_paths = ingest.extract_audio(input_file, job_id=job_id)
     total_duration = audio_paths["duration"]
+    is_video = audio_paths.get("is_video", False)
+    source_video_path = audio_paths.get("source_video_path")
     logger.info("Duration: %.1f s", total_duration)
 
     # ── Stage 2: Source Separation ────────────────────────────────────────
@@ -79,14 +83,12 @@ def run_pipeline(
         _progress("Separating stems with Demucs (CPU — may take a while)", 10)
         stems = separation.separate_stems(audio_paths["full_44k"], job_id=job_id)
 
-    # ── Stage 2b: Convert vocals to 16 kHz for ASR ────────────────────────
-    vocals_16k = transcribe.convert_vocals_to_16k(stems["vocals"], job_id=job_id)
-
-    # ── Stage 3: Transcribe + Diarize ─────────────────────────────────────
-    _progress("Transcribing audio (Whisper + speaker diarization)", 25)
+    # ── Stage 3: Transcribe + Diarize (AssemblyAI) ────────────────────────
+    _progress("Transcribing audio (AssemblyAI — transcription + diarization)", 25)
     segments = transcribe.transcribe_and_diarize(
+        audio_path=audio_paths["full_44k"],
+        vocals_path=stems.get("vocals"),
         audio_16k_path=audio_paths["full_16k"],
-        vocals_16k_path=vocals_16k,
     )
     segments = merge_short_segments(segments, min_duration=0.5, gap_threshold=0.3)
     logger.info("Segments after merge: %d", len(segments))
@@ -105,9 +107,13 @@ def run_pipeline(
 
     # ── Stage 4c: Emotion analysis ──────────────────────────────────────
     if config.ENABLE_EMOTION:
-        _progress("Analysing emotions per segment (Gemini)", 42)
         from backend.pipeline import emotion
-        segments = emotion.analyze_emotions(segments)
+        if config.GEMINI_AUDIO_EMOTION:
+            _progress("Analysing emotions from source audio (Gemini audio)", 42)
+            segments = emotion.analyze_emotions_with_audio(segments, job_id=job_id)
+        else:
+            _progress("Analysing emotions per segment (Gemini text)", 42)
+            segments = emotion.analyze_emotions(segments)
 
     # ── Stage 5: Translate (emotion-aware) ──────────────────────────────
     _progress(f"Translating to {target_language.title()} (Gemini)", 45)
@@ -131,15 +137,29 @@ def run_pipeline(
         _progress("Applying acoustic character matching", 82)
         segments = acoustic.apply_acoustic_matching(segments, stems["vocals"], job_id=job_id)
 
+    # ── Stage 7b: Pedalboard post-processing chain ────────────────────────
+    _progress("Applying studio post-processing chain (EQ + compression + reverb)", 86)
+    segments = postprocess.apply_pedalboard_chain(segments, job_id=job_id)
+
     # ── Stage 8: Assemble final output ────────────────────────────────────
-    _progress("Assembling final dubbed audio", 90)
+    _progress("Assembling final dubbed audio (dynamic ducking mix)", 90)
     output_path = assemble.assemble_output(
         segments=segments,
-        no_vocals_path=stems["no_vocals"],
+        no_vocals_path=stems.get("no_vocals"),
         total_duration=total_duration,
         job_id=job_id,
         output_filename=output_filename,
     )
+
+    # ── Stage 9: Quality assessment (off by default) ──────────────────────
+    if config.ENABLE_QUALITY_CHECK:
+        _progress("Running quality assessment (MOS scoring)", 95)
+        segments = quality.run_quality_check(
+            segments,
+            use_gemini=config.QUALITY_CHECK_GEMINI,
+            mos_threshold=config.MOS_THRESHOLD,
+            job_id=job_id,
+        )
 
     # ── Cleanup voice profiles from ElevenLabs ────────────────────────────
     synthesize.cleanup_cloned_voices(voice_profiles)
@@ -153,9 +173,302 @@ def run_pipeline(
     return {
         "output_path": output_path,
         "segments": segments,
+        "voice_profiles": {k: {"voice_id": v.get("voice_id")} for k, v in voice_profiles.items()},
         "duration": total_duration,
         "elapsed": elapsed,
         "source_lang": source_lang,
+        "is_video": is_video,
+        "source_video_path": source_video_path,
+    }
+
+
+def _output_to_original(t: float, keep_ranges: list[dict]) -> float:
+    """Map a timestamp in the concatenated output audio back to the original source timeline."""
+    cumulative = 0.0
+    for r in keep_ranges:
+        dur = r["end"] - r["start"]
+        if t <= cumulative + dur + 0.001:
+            return round(r["start"] + max(0.0, t - cumulative), 3)
+        cumulative += dur
+    return round(keep_ranges[-1]["end"], 3)
+
+
+def run_analysis_pipeline(
+    input_file: str,
+    job_id: str,
+    skip_separation: bool = False,
+    trim_in: float = 0.0,
+    trim_out: float = 0.0,
+    keep_ranges: list[dict] | None = None,
+    progress_callback=None,
+    script_text: str | None = None,
+) -> dict:
+    """Stage A: ingest → separate → transcribe → diarize → segment audio → emotion.
+
+    Returns everything needed for Stage B without doing any translation or synthesis.
+    """
+    from backend.pipeline import ingest, separation, transcribe, synthesize
+    from backend.utils.timing import merge_short_segments
+
+    def _progress(stage: str, pct: float):
+        logger.info("[%3d%%] %s", int(pct), stage)
+        if progress_callback:
+            progress_callback(stage, pct)
+
+    start_time = time.time()
+
+    _progress("Extracting audio from video", 5)
+    audio_paths = ingest.extract_audio(
+        input_file, job_id=job_id,
+        trim_in=trim_in, trim_out=trim_out,
+        keep_ranges=keep_ranges or None,
+    )
+    total_duration = audio_paths["duration"]
+    is_video = audio_paths.get("is_video", False)
+    source_video_path = audio_paths.get("source_video_path")
+
+    if skip_separation:
+        _progress("Skipping vocal isolation", 15)
+        stems = separation.skip_separation(audio_paths["full_44k"], job_id=job_id)
+    else:
+        _progress("Isolating vocals (ElevenLabs Audio Isolation)", 10)
+        stems = separation.separate_stems(audio_paths["full_44k"], job_id=job_id)
+
+    _progress("Transcribing + diarizing (AssemblyAI)", 25)
+    segments = transcribe.transcribe_and_diarize(
+        audio_path=audio_paths["full_44k"],
+        vocals_path=stems.get("vocals"),
+        audio_16k_path=audio_paths["full_16k"],
+    )
+    segments = merge_short_segments(segments, min_duration=0.5, gap_threshold=0.3)
+    logger.info("Segments after merge: %d", len(segments))
+
+    # Extract segment audio BEFORE remapping — the vocals stem is in trimmed time
+    _progress("Extracting per-segment source audio", 50)
+    segments = synthesize.extract_segment_audio(segments, stems["vocals"], job_id=job_id)
+
+    # Store local (trimmed) timestamps so assembly can use them after remapping
+    for seg in segments:
+        seg["local_start"] = seg["start"]
+        seg["local_end"]   = seg["end"]
+
+    # Remap timestamps to original source timeline for display in the editor
+    if keep_ranges:
+        for seg in segments:
+            seg["start"] = _output_to_original(seg["start"], keep_ranges)
+            seg["end"]   = _output_to_original(seg["end"],   keep_ranges)
+    elif trim_in > 0:
+        for seg in segments:
+            seg["start"] = round(seg["start"] + trim_in, 3)
+            seg["end"]   = round(seg["end"]   + trim_in, 3)
+
+    if script_text:
+        _progress("Aligning script to segments", 60)
+        from backend.pipeline import script_align
+        script_lines = script_align.parse_script(script_text)
+        if script_lines:
+            segments = script_align.align_script_to_segments(segments, script_lines)
+
+    if config.ENABLE_EMOTION:
+        from backend.pipeline import emotion
+        if config.GEMINI_AUDIO_EMOTION:
+            _progress("Analysing emotions from source audio (Gemini)", 70)
+            segments = emotion.analyze_emotions_with_audio(segments, job_id=job_id)
+        else:
+            _progress("Analysing emotions (Gemini text)", 70)
+            segments = emotion.analyze_emotions(segments)
+
+    elapsed = time.time() - start_time
+    _progress("Analysis complete", 100)
+    source_lang = segments[0].get("source_lang", "unknown") if segments else "unknown"
+
+    return {
+        "segments": segments,
+        "stems_vocals_path": str(stems["vocals"]) if stems.get("vocals") else None,
+        "stems_no_vocals_path": str(stems["no_vocals"]) if stems.get("no_vocals") else None,
+        "duration": total_duration,
+        "is_video": is_video,
+        "source_video_path": source_video_path,
+        "source_lang": source_lang,
+        "elapsed": elapsed,
+    }
+
+
+def run_dub_from_analysis(
+    job_id: str,
+    segments: list,
+    stems_vocals_path: str | None,
+    stems_no_vocals_path: str | None,
+    total_duration: float,
+    target_language: str,
+    skip_prosody: bool = False,
+    skip_acoustic: bool = False,
+    output_filename: str | None = None,
+    progress_callback=None,
+) -> dict:
+    """Stage B (Translation Dubbing): translate → TTS → prosody → acoustic → assemble.
+
+    Picks up from the result of run_analysis_pipeline — no re-processing of audio.
+    """
+    from backend.pipeline import translate, synthesize, prosody, acoustic, assemble, postprocess, quality
+
+    def _progress(stage: str, pct: float):
+        logger.info("[%3d%%] %s", int(pct), stage)
+        if progress_callback:
+            progress_callback(stage, pct)
+
+    start_time = time.time()
+
+    _progress(f"Translating to {target_language.title()} (Gemini)", 10)
+    segments = translate.translate_segments(segments, target_language=target_language)
+
+    _progress("Building voice profiles & cloning voices", 25)
+    voice_profiles = synthesize.build_voice_profiles(segments, stems_vocals_path, job_id=job_id)
+
+    _progress("Synthesising dubbed speech (ElevenLabs TTS)", 40)
+    segments = synthesize.synthesize_segments(segments, voice_profiles, target_language, job_id=job_id)
+
+    if not skip_prosody:
+        _progress("Applying prosody transfer", 60)
+        segments = prosody.apply_prosody_transfer(segments, job_id=job_id)
+
+    if not skip_acoustic:
+        _progress("Applying acoustic matching", 72)
+        segments = acoustic.apply_acoustic_matching(segments, stems_vocals_path, job_id=job_id)
+
+    _progress("Applying post-processing chain", 82)
+    segments = postprocess.apply_pedalboard_chain(segments, job_id=job_id)
+
+    _progress("Assembling final dubbed audio", 90)
+    # If keep_ranges was used during analysis, segments carry original-timeline timestamps
+    # (for display) but the stems + container are only `total_duration` seconds long.
+    # Use the stored local_start/local_end so assembly places audio correctly.
+    has_local = any("local_start" in s for s in segments)
+    if has_local:
+        assembly_segs = [{**s, "start": s["local_start"], "end": s["local_end"]} for s in segments]
+    else:
+        assembly_segs = segments
+
+    output_path = assemble.assemble_output(
+        segments=assembly_segs,
+        no_vocals_path=stems_no_vocals_path,
+        total_duration=total_duration,
+        job_id=job_id,
+        output_filename=output_filename,
+    )
+
+    # Propagate dubbed_duration_s back to the original segment list
+    if has_local:
+        for orig, asm in zip(segments, assembly_segs):
+            if "dubbed_duration_s" in asm:
+                orig["dubbed_duration_s"] = asm["dubbed_duration_s"]
+
+    if config.ENABLE_QUALITY_CHECK:
+        _progress("Running quality assessment", 95)
+        segments = quality.run_quality_check(
+            segments,
+            use_gemini=config.QUALITY_CHECK_GEMINI,
+            mos_threshold=config.MOS_THRESHOLD,
+            job_id=job_id,
+        )
+
+    synthesize.cleanup_cloned_voices(voice_profiles)
+
+    elapsed = time.time() - start_time
+    _progress("Done!", 100)
+    source_lang = segments[0].get("source_lang", "unknown") if segments else "unknown"
+
+    return {
+        "output_path": output_path,
+        "segments": segments,
+        "voice_profiles": {k: {"voice_id": v.get("voice_id")} for k, v in voice_profiles.items()},
+        "duration": total_duration,
+        "elapsed": elapsed,
+        "source_lang": source_lang,
+    }
+
+
+def run_voice_dub_from_analysis(
+    job_id: str,
+    segments: list,
+    stems_no_vocals_path: str | None,
+    total_duration: float,
+    voice_assignments: dict[str, str],
+    dialogue_paths: dict[str, str],
+    progress_callback=None,
+    output_filename: str | None = None,
+) -> dict:
+    """Stage B (Voice Mode): STS per speaker using Voice Library voice_ids → assemble.
+
+    Args:
+        voice_assignments: {speaker_id: elevenlabs_voice_id} from Voice Library
+        dialogue_paths: {speaker_id: path_to_user_dialogue_audio}
+    """
+    from backend.pipeline import synthesize, assemble
+    from backend.utils.audio import load_audio, save_audio, stereo_to_mono, normalize_peak
+    from backend.utils.audio import reduce_noise_spectral, match_spectral_envelope
+
+    def _progress(stage: str, pct: float):
+        logger.info("[%3d%%] %s", int(pct), stage)
+        if progress_callback:
+            progress_callback(stage, pct)
+
+    start_time = time.time()
+    speakers = list(voice_assignments.keys())
+    pct_per_speaker = 70 / max(len(speakers), 1)
+
+    for i, speaker_id in enumerate(speakers):
+        voice_id = voice_assignments[speaker_id]
+        dialogue_path = dialogue_paths.get(speaker_id)
+        if not dialogue_path:
+            logger.warning("No dialogue audio for %s — skipping.", speaker_id)
+            continue
+
+        base_pct = 5 + i * pct_per_speaker
+
+        # Determine dominant emotion from this speaker's segments
+        char_segs = [s for s in segments if s.get("speaker_id") == speaker_id]
+        emotions = [s.get("emotion", "neutral") for s in char_segs]
+        dominant_emotion = max(set(emotions), key=emotions.count) if emotions else "neutral"
+        avg_intensity = sum(s.get("emotion_intensity", 0.5) for s in char_segs) / max(len(char_segs), 1)
+
+        _progress(f"Cleaning dialogue for {speaker_id}", base_pct)
+        dlg_audio, dlg_sr = load_audio(dialogue_path)
+        dlg_mono = stereo_to_mono(dlg_audio)
+        dlg_clean = reduce_noise_spectral(dlg_mono, dlg_sr)
+        dlg_clean = normalize_peak(dlg_clean, target_db=-3.0)
+        clean_path = config.TEMP_DIR / job_id / f"dlg_clean_{speaker_id}.wav"
+        save_audio(dlg_clean, clean_path, dlg_sr)
+
+        _progress(f"Converting voice for {speaker_id} (STS)", base_pct + pct_per_speaker * 0.5)
+        out_path = config.OUTPUT_DIR / f"voice_{speaker_id}_{job_id}.wav"
+        synthesize.speech_to_speech(
+            voice_id=voice_id,
+            input_audio_path=str(clean_path),
+            output_path=out_path,
+            emotion=dominant_emotion,
+            emotion_intensity=avg_intensity,
+        )
+
+    _progress("Assembling final output", 85)
+    has_local = any("local_start" in s for s in segments)
+    assembly_segs = [{**s, "start": s["local_start"], "end": s["local_end"]} for s in segments] if has_local else segments
+    output_path = assemble.assemble_output(
+        segments=assembly_segs,
+        no_vocals_path=stems_no_vocals_path,
+        total_duration=total_duration,
+        job_id=job_id,
+        output_filename=output_filename,
+    )
+
+    elapsed = time.time() - start_time
+    _progress("Done!", 100)
+
+    return {
+        "output_path": output_path,
+        "segments": segments,
+        "duration": total_duration,
+        "elapsed": elapsed,
     }
 
 
@@ -398,15 +711,15 @@ def analyze_characters(
     if skip_separation:
         stems = separation.skip_separation(audio_paths["full_44k"], job_id=job_id)
     else:
-        _progress("Separating stems with Demucs", 10)
+        _progress("Isolating vocals (ElevenLabs Audio Isolation)", 10)
         stems = separation.separate_stems(audio_paths["full_44k"], job_id=job_id)
 
     # Transcribe + Diarize
-    vocals_16k = transcribe.convert_vocals_to_16k(stems["vocals"], job_id=job_id)
-    _progress("Transcribing + diarizing speakers", 40)
+    _progress("Transcribing + diarizing speakers (AssemblyAI)", 40)
     segments = transcribe.transcribe_and_diarize(
+        audio_path=audio_paths["full_44k"],
+        vocals_path=stems.get("vocals"),
         audio_16k_path=audio_paths["full_16k"],
-        vocals_16k_path=vocals_16k,
     )
     segments = merge_short_segments(segments, min_duration=0.5, gap_threshold=0.3)
 
@@ -424,9 +737,13 @@ def analyze_characters(
 
     # Emotion analysis
     if config.ENABLE_EMOTION:
-        _progress("Analysing emotions", 65)
         from backend.pipeline import emotion
-        segments = emotion.analyze_emotions(segments)
+        if config.GEMINI_AUDIO_EMOTION:
+            _progress("Analysing emotions from source audio (Gemini audio)", 65)
+            segments = emotion.analyze_emotions_with_audio(segments, job_id=job_id)
+        else:
+            _progress("Analysing emotions (Gemini text)", 65)
+            segments = emotion.analyze_emotions(segments)
 
     # Detect characters
     _progress("Detecting characters", 80)
@@ -436,7 +753,7 @@ def analyze_characters(
     return {
         "characters": characters,
         "segments": segments,
-        "stems": {"vocals": str(stems["vocals"]), "no_vocals": str(stems["no_vocals"])},
+        "stems": {"vocals": str(stems["vocals"]), "no_vocals": str(stems.get("no_vocals") or "")},
         "total_duration": audio_paths["duration"],
     }
 

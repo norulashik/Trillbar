@@ -44,6 +44,26 @@ EMOTION_VOICE_SETTINGS: dict[str, tuple[float, float, float]] = {
     "disgust":  (0.35, 0.40, 0.95),
 }
 
+# ── ElevenLabs v3 audio tags ──────────────────────────────────────────────────
+# Used when config.ELEVENLABS_USE_AUDIO_TAGS=True.
+# Tags are embedded in the TTS prompt text as [tag] prefixes.
+EMOTION_AUDIO_TAGS: dict[str, list[str]] = {
+    "neutral":  [],
+    "happy":    ["cheerful"],
+    "excited":  ["excited"],
+    "angry":    ["angry"],
+    "sad":      ["sad"],
+    "fear":     ["nervous"],
+    "surprise": ["surprised"],
+    "calm":     ["calm"],
+    "disgust":  ["disgusted"],
+}
+
+# High-energy emotions that also get a [fast] pacing tag above 0.65 intensity
+_FAST_EMOTIONS = {"excited", "angry", "fear"}
+# Low-energy emotions that get a [slow] pacing tag above 0.6 intensity
+_SLOW_EMOTIONS = {"sad", "calm"}
+
 def _emotion_voice_settings(emotion: str | None, intensity: float = 1.0) -> dict:
     """Return ElevenLabs voice_settings dict modulated by emotion."""
     neutral = EMOTION_VOICE_SETTINGS["neutral"]
@@ -58,6 +78,30 @@ def _emotion_voice_settings(emotion: str | None, intensity: float = 1.0) -> dict
         "style": round(style, 2),
         "use_speaker_boost": True,
     }
+
+
+def _build_v3_text(
+    text: str,
+    emotion: str | None,
+    emotion_intensity: float,
+) -> str:
+    """Wrap text with ElevenLabs v3 audio tags based on emotion.
+
+    Only active when config.ELEVENLABS_USE_AUDIO_TAGS=True.
+    Falls back to plain text if no tag mapping for the emotion.
+    """
+    tags = EMOTION_AUDIO_TAGS.get(emotion or "neutral", [])
+    if not tags:
+        return text
+
+    prefix_parts = [f"[{tags[0]}]"]
+
+    if emotion in _FAST_EMOTIONS and emotion_intensity > 0.65:
+        prefix_parts.append("[fast]")
+    elif emotion in _SLOW_EMOTIONS and emotion_intensity > 0.60:
+        prefix_parts.append("[slow]")
+
+    return " ".join(prefix_parts) + " " + text
 
 
 # ── Voice profile store: speaker_id → {voice_id, reference_path} ─────────────
@@ -158,6 +202,7 @@ def synthesize_segments(
 
         new_seg = dict(seg)
         new_seg["synth_audio_path"] = str(out_path)
+        new_seg["voice_id"] = voice_id  # stored for re-synthesis
         result.append(new_seg)
         logger.debug("Synthesised segment %d → %s", seg["id"], out_path.name)
 
@@ -277,11 +322,27 @@ def _clone_voice(speaker_id: str, ref_paths: list[Path] | Path) -> str | None:
             for fh in file_handles:
                 fh.close()
 
+        # Log the full response for debugging
+        logger.info("ElevenLabs /voices/add status=%d", resp.status_code)
+        if resp.status_code != 200:
+            logger.error(
+                "ElevenLabs voice cloning FAILED — status=%d body=%s",
+                resp.status_code, resp.text[:1000],
+            )
+
         if resp.status_code == 422:
             logger.warning(
-                "ElevenLabs voice cloning returned 422 (likely free-tier restriction). "
+                "ElevenLabs voice cloning returned 422 (validation error or plan restriction). "
                 "Falling back to default voice."
             )
+            return None
+
+        if resp.status_code == 401:
+            logger.error("ElevenLabs API key is invalid or unauthorized.")
+            return None
+
+        if resp.status_code == 429:
+            logger.error("ElevenLabs rate limit / quota exceeded.")
             return None
 
         resp.raise_for_status()
@@ -293,10 +354,11 @@ def _clone_voice(speaker_id: str, ref_paths: list[Path] | Path) -> str | None:
         return voice_id
 
     except requests.exceptions.HTTPError as e:
-        logger.warning("Voice cloning failed for %s: %s — response: %s", speaker_id, e, e.response.text[:500] if e.response else "no response")
+        body = e.response.text[:1000] if e.response else "no response"
+        logger.error("Voice cloning HTTP error for %s: %s — body: %s", speaker_id, e, body)
         return None
     except Exception as e:
-        logger.warning("Voice cloning failed for %s: %s — using fallback.", speaker_id, e)
+        logger.error("Voice cloning unexpected error for %s: %s", speaker_id, e, exc_info=True)
         return None
 
 
@@ -344,8 +406,13 @@ def _synth_elevenlabs(
         "Accept": "audio/mpeg",
     }
     voice_settings = _emotion_voice_settings(emotion, emotion_intensity)
+    tts_text = (
+        _build_v3_text(text, emotion, emotion_intensity)
+        if config.ELEVENLABS_USE_AUDIO_TAGS
+        else text
+    )
     payload = {
-        "text": text,
+        "text": tts_text,
         "model_id": config.ELEVENLABS_MODEL,
         "language_code": lang_code,
         "voice_settings": voice_settings,

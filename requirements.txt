@@ -1,35 +1,36 @@
-# Audio processing
+# FFmpeg Python wrapper (requires ffmpeg system binary)
+# Install ffmpeg: conda install -c conda-forge ffmpeg
+# OR download from https://ffmpeg.org/download.html
 ffmpeg-python>=0.2.0
+imageio[ffmpeg]>=2.31.0
+
+# Audio signal processing (lightweight, no ML models)
 librosa>=0.10.0
 soundfile>=0.12.0
 pydub>=0.25.0
 pyloudnorm>=0.1.1
-praat-parselmouth>=0.4.3
 numpy>=1.24.0
 
-# Source separation (heavy but CPU-compatible)
-demucs>=4.0.0
+# Studio-quality DSP
+# pyworld: WORLD vocoder — F0 contour extraction + formant-preserving resynthesis
+# Install: pip install pyworld   OR on Windows: conda install -c conda-forge pyworld
+pyworld>=0.3.4
+# pedalboard: Spotify's professional audio effects (EQ, compression, reverb, limiter)
+pedalboard>=0.9.0
 
-# ASR (CPU-friendly)
-faster-whisper>=1.0.0
+# Transcription + Speaker Diarization (cloud API — replaces whisper + pyannote)
+assemblyai>=0.30.0
 
-# Speaker diarization (requires HuggingFace token)
-pyannote.audio>=3.1.0
-
-# Translation / LLM
+# Translation + Emotion Analysis
 google-genai>=1.0.0
 
-# Voice cloning + TTS API
+# Voice cloning + TTS + Audio Isolation (cloud API)
 requests>=2.31.0
 
-# Web framework (backend)
+# Web framework
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
-
-# Frontend
-streamlit>=1.30.0
-pandas>=2.0.0
 
 # Utilities
 python-dotenv>=1.0.0
